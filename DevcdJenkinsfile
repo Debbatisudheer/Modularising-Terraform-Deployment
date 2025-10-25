@@ -1,0 +1,313 @@
+#!/usr/bin/env groovy
+
+def deployTerraformVersion(filepath, terraformStr) {
+    try {
+        tfInputVersion = sh(
+            script: """cat $filepath| jq -r '.$terraformStr' | awk '{print \$NF}' """,
+            returnStdout: true
+        ).trim()
+
+        echo "TerraformVersion found in deploymentdir for stack ${env.STACK} : ${tfInputVersion}"
+
+        if (tfInputVersion == "null") {
+            echo "Error: Couldnt find input file terraform version ${tfInputVersion}"
+            return
+        }
+
+        sh "tfenv list > tfenvList.txt"
+        tVersionExists = sh(
+            script: """grep $tfInputVersion tfenvList.txt""",
+            returnStdout: true
+        ).trim()
+
+        echo "tVersion output: ${tVersionExists}"
+
+        if ("${tVersionExists}".contains(tfInputVersion)) {
+            def tfData = readFile "tfenvList.txt"
+            def lines = tfData.readLines()
+
+            for (line in lines) {
+                if ("${line}".contains(tfInputVersion)) {
+                    str = line.split(" ")
+                    for (String value : str) {
+                        if ("${value}".contains(tfInputVersion)) {
+                            sh "tfenv use ${value}"
+                            echo "Terraform version is set to ${value}"
+                            env.TERRAFORM_VERSION = value
+                            echo sh(script: 'terraform version', returnStdout: true)
+                            return true
+                        }
+                    }
+                }
+            }
+        } else {
+            echo "Error: Couldnt find matching terraform version ${tfInputVersion}"
+            throw err
+        }
+    } catch (err) {
+        echo "Error getting tfenv terraform version ${err}"
+        throw err
+    }
+}
+
+def notifyWebExTeamSpace() {
+    sh 'echo "Sending Jenkins Notification."'
+    sparkSend(
+        credentialsId: 'EventingTeamNotificationBot',
+        message: """ ${env.JOB_NAME} => <br/>&nbsp;&nbsp; 
+                     URL: ${BUILD_URL} <br/>&nbsp;&nbsp; 
+                     Build # ${env.BUILD_NUMBER} <br/>&nbsp;&nbsp; 
+                     Result: **${currentBuild.result}** <br/>&nbsp;&nbsp; 
+                     End Stage: ${env.BUILD_STAGE} <br/>&nbsp;&nbsp; 
+                     ${currentBuild.description}""",
+        messageType: 'markdown',
+        spaceList: [[
+            spaceId: 'f2d80880-1a79-11e9-84f0-11dd39fb673a',
+            spaceName: 'Build'
+        ]]
+    )
+}
+
+def getAWSCredsForDevCD() {
+    sh "cd ${env.WORKSPACE}"
+    sh """ unset AWS_SECRET_ACCESS_KEY
+           unset AWS_ACCESS_KEY_ID
+           unset AWS_SESSION_TOKEN
+           aws sts assume-role \
+             --role-arn arn:aws:iam::182570719012:role/ci-server \
+             --role-session-name jenkins-ci \
+             --duration-seconds ${env.CRED_DURATION} > aws_creds_output """
+
+    env.AWS_SESSION_TOKEN = sh(
+        script: """grep SessionToken aws_creds_output | cut -d ':' -f2 | tr -d '"' | tr -d ','""",
+        returnStdout: true
+    ).trim()
+
+    env.AWS_ACCESS_KEY_ID = sh(
+        script: """grep AccessKeyId aws_creds_output | cut -d ':' -f2 | tr -d '"' | tr -d ','""",
+        returnStdout: true
+    ).trim()
+
+    env.AWS_SECRET_ACCESS_KEY = sh(
+        script: """grep SecretAccessKey aws_creds_output | cut -d ':' -f2 | tr -d '"' | tr -d ','""",
+        returnStdout: true
+    ).trim()
+}
+
+def loadEnvironmentVariables(path) {
+    def props = readProperties file: path
+    keys = props.keySet()
+    for (key in keys) {
+        value = props["${key}"]
+        env."${key}" = "${value}"
+    }
+}
+
+def publishUnitTestResult() {
+    junit keepLongStdio: true, testResults: '**/*xunit.xml'
+}
+
+def publishCoverageResult() {
+    cobertura(
+        autoUpdateHealth: false,
+        autoUpdateStability: false,
+        classCoverageTargets: '94, 94, 94',
+        coberturaReportFile: '**/*cobertura-coverage.xml',
+        conditionalCoverageTargets: '92, 92, 92',
+        failUnhealthy: true,
+        failUnstable: true,
+        fileCoverageTargets: '96, 96, 96',
+        lineCoverageTargets: '94, 94, 94',
+        maxNumberOfBuilds: 100,
+        methodCoverageTargets: '97, 97, 97',
+        onlyStable: false,
+        sourceEncoding: 'ASCII',
+        zoomCoverageChart: false
+    )
+}
+
+properties([
+    parameters([
+        string(name: 'GIT_HASH', defaultValue: '', description: 'Commit hash to checkout (leave blank for default branch)'),
+        choice(name: 'STACK', choices: ['devcd', 'integ3', 'staging'], description: 'Select the stack for deployment'),
+        choice(name: 'DEPLOYMENT_SET', choices: ['EC', 'ISE'], description: 'Select deployment set'),
+        [
+            $class: 'CascadeChoiceParameter',
+            choiceType: 'PT_MULTI_SELECT',
+            description: 'Select components to deploy',
+            name: 'COMPONENTS',
+            randomName: 'components-choice',
+            referencedParameters: 'DEPLOYMENT_SET',
+            script: [
+                $class: 'GroovyScript',
+                fallbackScript: [
+                    classpath: [],
+                    sandbox: true,
+                    script: ''' return ['infra', 'alb', 'waf', 'ecservice', 'splunk'] '''
+                ],
+                script: [
+                    classpath: [],
+                    sandbox: true,
+                    script: '''
+                        def deploymentSet = DEPLOYMENT_SET
+                        if (deploymentSet == null || deploymentSet.trim() == '') {
+                            return ['infra', 'alb', 'waf', 'ecservice', 'splunk']
+                        }
+                        if (deploymentSet == 'EC') {
+                            return ['infra', 'alb', 'waf', 'ecservice', 'splunk']
+                        } else if (deploymentSet == 'ISE') {
+                            return ['infra', 'alb', 'waf', 'ecservice', 'splunk', 'datadog']
+                        } else {
+                            return []
+                        }
+                    '''
+                ]
+            ]
+        ],
+        text(
+            name: 'ARTIFACT_TAGS',
+            defaultValue: '''ecservice=CD_PASSED''',
+            description: 'One image tag per line. Format: component=tag'
+        )
+    ])
+])
+
+node("${env.BUILD_NODE}") {
+    ansiColor('xterm') {
+        deleteDir()
+
+        stage('Environment Prepare') {
+            env.BUILD_STAGE = "PREPARE"
+            env.WKSP = "${env.WORKSPACE}/src/event-collector"
+            env.CRED_DURATION = '43200'
+            env.STACK = params.STACK
+            env.AWS_REGION = 'us-east-1'
+            env.AWS_DEFAULT_REGION = 'us-east-1'
+            env.AWS_STS_ENDPOINT = "https://sts.us-east-1.amazonaws.com"
+            env.ROLLBACK = '0'
+            env.JENKINS_BUILD = "${env.BUILD_NUMBER}"
+            env.TF_LOG = "DEBUG"
+            env.TF_LOG_PATH = "${env.WKSP}/tf.log"
+            env.TF_PLUGIN_CACHE_DIR = "${env.WORKSPACE}/.terraform.d/plugin-cache"
+            env.DATADOG_TAG = "devcd-vis"
+            env.MONITOR_NAME = 'AWS_ECS_pending_service_count'
+            env.DEPLOYMENTDIR = "${env.WKSP}/deployments/${params.DEPLOYMENT_SET.toLowerCase()}/${params.STACK}"
+
+            getAWSCredsForDevCD()
+
+            echo "Environment Variables: "
+            echo sh(script: 'env|sort', returnStdout: true)
+
+            sh "echo plugin_cache_dir = \\\"${TF_PLUGIN_CACHE_DIR}\\\" > ${env.HOME}/.terraformrc"
+            sh "mkdir -p ${env.WORKSPACE}/{src,bin,pkg,.terraform.d}"
+            sh "mkdir -p ${env.TF_PLUGIN_CACHE_DIR}"
+        }
+
+        dir('src/event-collector') {
+            if (params.GIT_HASH?.trim()) {
+                env.BRANCH = params.GIT_HASH
+                echo "Using provided GIT_HASH: ${env.BRANCH}"
+            } else {
+                env.BRANCH = "*/DeployJenkinsfile"
+                echo "Using default branch: ${env.BRANCH}"
+            }
+
+            try {
+                stage('Checkout') {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "${env.BRANCH}"]],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [$class: 'CloneOption', depth: 0, noTags: true, reference: '', shallow: false],
+                            [$class: 'PruneStaleBranch']
+                        ],
+                        gitTool: 'Default',
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[
+                            credentialsId: 'GithubSSHCredential-FIPSCompliant',
+                            url: 'git@github.com:cisco-sbg/cspe-event-collector'
+                        ]]
+                    ])
+
+                    def gitHeadShort = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true)
+                    currentBuild.description = "Git Tag: git${gitHeadShort}".trim()
+                    env.DEVCD_GIT_TAG = "${gitHeadShort}".trim()
+
+                    def gitHeadLong = sh(script: 'git rev-parse HEAD', returnStdout: true)
+                    writeFile file: 'gitHead.txt', text: "GIT_HEAD=${gitHeadLong}".trim()
+                }
+            } catch (err) {
+                echo "Checkout failed: ${err}"
+                currentBuild.result = 'FAILURE'
+                throw err
+            }
+        }
+
+        lock("event-collector-${env.STACK}-stack") {
+            stage('Deploy') {
+                env.ROLLBACK = '1'
+                env.BUILD_STAGE = "DEPLOY"
+                env.ecserviceArtifactTag = params.ecserviceArtifactTag
+                sh "cd ${env.WKSP}"
+
+                def compParam = params.COMPONENTS?.trim() ?: ''
+                def componentsArg = compParam.replaceAll(/\s*,\s*/, ' ')
+
+                def artifactTagsLines = params.ARTIFACT_TAGS.trim().split('\n')
+                def dynamicEnvVars = []
+                for (line in artifactTagsLines) {
+                    def pair = line.split('=')
+                    if (pair.length == 2) {
+                        def key = pair[0].trim().toUpperCase() + "_ARTIFACT_TAG"
+                        def val = pair[1].trim()
+                        dynamicEnvVars << "${key}=${val}"
+                    }
+                }
+
+                echo "Deploying components: '${componentsArg}'"
+
+                def inputFile = "${env.DEPLOYMENTDIR}/input.json"
+
+                withEnv([
+                    "TERRAFORM_BIN_PATH=terraform",
+                    "USR_SCRIPTS_PATH=${env.WKSP}/scripts",
+                    "DEPLOYMENTDIR=${env.DEPLOYMENTDIR}",
+                    "WORKSPACE=${env.WKSP}",
+                    "ECSERVICE_ARTIFACT_TAG=${env.ecserviceArtifactTag}"
+                ] + dynamicEnvVars) {
+                    sh """ 
+                        echo "Creating DEVCD Deployment for all components" 
+                        python3 "$USR_SCRIPTS_PATH/createDeployment.py" \
+                          -t "${env.WKSP}/deployments/templates" \
+                          -i "$inputFile" \
+                          -d "$DEPLOYMENTDIR" --fullStack 
+                    """
+
+                    retry(2) {
+                        try {
+                            deployTerraformVersion("${DEPLOYMENTDIR}/input.json", "terraform_current_version")
+                            tee("${env.WKSP}/deploy.log") {
+                                sh """ bash "$USR_SCRIPTS_PATH/updateStack.sh" ${componentsArg} """
+                            }
+                        } catch (depError) {
+                            echo 'Deployment failed with error: ' + depError.toString()
+                            def logs = readFile "${env.WKSP}/deploy.log"
+                            if (logs =~ /(dial|net).*timeout/) {
+                                echo 'Retrying due to AWSTimeout'
+                                throw depError
+                            } else {
+                                echo 'Failed while deploying'
+                                currentBuild.result = 'FAILURE'
+                            }
+                        }
+                    }
+
+                    if (currentBuild.result == 'FAILURE') {
+                        error("Deployment Failed")
+                    }
+                }
+            }
+        }
+    }
+}
